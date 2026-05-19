@@ -1,51 +1,30 @@
 // ============================================================================
 //  EBUTUOY :: backend
 // ============================================================================
-//  An anti-popularity YouTube discovery engine with a deliberate-replay system.
-//
-//  Philosophy:
-//    YouTube infers from passive signals. We capture only deliberate ones.
-//    The user tells us what they want to see again, and on what cadence.
-//    We surface obscure content by default (under 1000 views, under 1000 subs)
-//    and never replay seen videos except when the user explicitly said to.
-//
-//  Architecture:
-//    - Express HTTP server on Railway
-//    - sql.js (WebAssembly SQLite) for persistent storage
-//    - YouTube Data API v3 for content discovery
-//    - Tag and revisit system layered on top of the search pipeline
+//  An anti-popularity YouTube discovery engine.
 //
 //  Endpoints:
 //    GET  /health             service status check
-//    GET  /seen               every video_id this profile has been served
-//    POST /seen               record that a video was served (frontend on each play)
-//    GET  /search             discover obscure videos (topic / local / roulette)
-//    POST /tag                attach one or more tags to a video
-//    GET  /revisit-eligible   videos in revisit queue that are due to play again
+//    GET  /seen               every video_id served (paginated count)
+//    POST /seen               record a video as served
+//    GET  /search             discover obscure videos
+//    POST /tag                attach tags to a video
+//    GET  /revisit-eligible   videos due for replay
+//    POST /revisit-played     mark a revisit as just-played
 //
-//  Tag semantics:
-//    A "tag" is any string the user attaches to a video. We don't distinguish
-//    topic tags from special tags at the storage level; the frontend knows
-//    which are special. The one tag that has backend behaviour is the literal
-//    string "revisit" (the frontend sends this when "add to revisit playlist"
-//    is selected). When that tag lands, we also write a row into revisit_queue
-//    so we can compute eligibility later without scanning all tags.
-//
-//  Revisit eligibility math:
-//    A revisit-tagged video becomes eligible to play again when BOTH:
-//      - 24 hours have passed since the tag was applied
-//      - 100 other videos have been served since the tag was applied
-//    Once played via revisit, it re-enters the queue under the same rules.
-//    Untagging removes it from the queue (untag endpoint, future work).
+//  Language filter (this revision):
+//    /search now drops videos whose defaultAudioLanguage is set to anything
+//    other than English (en, en-US, en-GB, etc). Videos with no language
+//    field set are allowed through (small creators often don't tag), and
+//    a script-based check rejects titles dominated by non-Latin scripts.
 //
 // ----------------------------------------------------------------------------
 //  Authorship log (most recent first):
+//    [ORANGE]  add English-preferred language filter to /search
 //    [ORANGE]  add tag system + revisit queue with 24hr/100vid eligibility
 //    [ORANGE]  add roulette mode (random global geo), expand /search
 //    [ORANGE]  initial scaffold + search pipeline
 // ----------------------------------------------------------------------------
-
-// ===== imports ==============================================================
 
 const express   = require('express');
 const cors      = require('cors');
@@ -54,31 +33,20 @@ const fs        = require('fs');
 const path      = require('path');
 require('dotenv').config();
 
-// ===== app setup ============================================================
-
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// ===== configuration ========================================================
 
 const DB_PATH                  = path.join(__dirname, 'ebutuoy.db');
 const YT_KEY                   = process.env.YOUTUBE_API_KEY;
 const MAX_VIEWS                = 1000;
 const MAX_SUBS                 = 1000;
 const FETCH_N                  = 50;
-
-// revisit eligibility constants
-const REVISIT_MIN_HOURS        = 24;     // hours that must elapse before re-play
-const REVISIT_MIN_VIDEOS_SEEN  = 100;    // other videos that must be seen first
-
-// ===== database =============================================================
+const REVISIT_MIN_HOURS        = 24;
+const REVISIT_MIN_VIDEOS_SEEN  = 100;
 
 let db;
 
-// initDb()
-// Loads the SQLite database from disk or creates fresh. Creates all tables
-// idempotently so adding new ones in a later revision doesn't break old data.
 async function initDb() {
   const SQL = await initSqlJs();
   if (fs.existsSync(DB_PATH)) {
@@ -86,48 +54,28 @@ async function initDb() {
   } else {
     db = new SQL.Database();
   }
-
-  // seen_videos: the never-replay-without-permission log
-  db.run(`
-    CREATE TABLE IF NOT EXISTS seen_videos (
-      video_id  TEXT PRIMARY KEY,
-      seen_at   INTEGER NOT NULL,
-      title     TEXT,
-      channel   TEXT
-    )
-  `);
-
-  // tag_actions: every (video_id, tag) pair the user has ever applied.
-  // We keep all of them, even repeated applies, so analytics later can see
-  // tag history over time. PRIMARY KEY is composite (video + tag + ts).
-  db.run(`
-    CREATE TABLE IF NOT EXISTS tag_actions (
-      video_id   TEXT NOT NULL,
-      tag        TEXT NOT NULL,
-      applied_at INTEGER NOT NULL,
-      title      TEXT,
-      channel    TEXT,
-      PRIMARY KEY (video_id, tag, applied_at)
-    )
-  `);
-
-  // revisit_queue: the videos waiting to be served again per user rule.
-  // status = 'pending' means it's waiting for eligibility, 'played' means
-  // it just played and is waiting for the next cycle. We re-set it to
-  // 'pending' (with a fresh tagged_at) every time it plays.
-  // videos_seen_at_tag is the snapshot of how many videos had been seen
-  // when this entry was inserted; eligibility compares against current count.
-  db.run(`
-    CREATE TABLE IF NOT EXISTS revisit_queue (
-      video_id              TEXT PRIMARY KEY,
-      title                 TEXT,
-      channel               TEXT,
-      tagged_at             INTEGER NOT NULL,
-      videos_seen_at_tag    INTEGER NOT NULL,
-      last_replayed_at      INTEGER
-    )
-  `);
-
+  db.run(`CREATE TABLE IF NOT EXISTS seen_videos (
+    video_id TEXT PRIMARY KEY,
+    seen_at  INTEGER NOT NULL,
+    title    TEXT,
+    channel  TEXT
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS tag_actions (
+    video_id   TEXT NOT NULL,
+    tag        TEXT NOT NULL,
+    applied_at INTEGER NOT NULL,
+    title      TEXT,
+    channel    TEXT,
+    PRIMARY KEY (video_id, tag, applied_at)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS revisit_queue (
+    video_id           TEXT PRIMARY KEY,
+    title              TEXT,
+    channel            TEXT,
+    tagged_at          INTEGER NOT NULL,
+    videos_seen_at_tag INTEGER NOT NULL,
+    last_replayed_at   INTEGER
+  )`);
   saveDb();
 }
 
@@ -135,8 +83,6 @@ function saveDb() {
   fs.writeFileSync(DB_PATH, Buffer.from(db.export()));
 }
 
-// getSeenSet()
-// Returns a Set of all video_ids ever served.
 function getSeenSet() {
   const stmt = db.prepare('SELECT video_id FROM seen_videos');
   const set  = new Set();
@@ -145,8 +91,6 @@ function getSeenSet() {
   return set;
 }
 
-// getSeenCount()
-// Returns the total number of videos ever served. Used by revisit eligibility.
 function getSeenCount() {
   const stmt = db.prepare('SELECT COUNT(*) AS c FROM seen_videos');
   stmt.step();
@@ -155,10 +99,6 @@ function getSeenCount() {
   return c;
 }
 
-// ===== helpers ==============================================================
-
-// randomLand()
-// Returns a random lat/lng coordinate biased toward populated landmasses.
 function randomLand() {
   const regions = [
     [25,  50,  -125, -70],
@@ -176,7 +116,64 @@ function randomLand() {
   };
 }
 
-// ===== routes ===============================================================
+// ===== LANGUAGE FILTER =====================================================
+
+// isLikelyEnglish(video)
+// Returns true if the video is plausibly English content, false if it
+// looks foreign-language.
+//
+// Strategy (in priority order):
+//   1. If defaultAudioLanguage starts with "en", trust it absolutely.
+//   2. If defaultAudioLanguage is set to a non-en language, reject.
+//   3. If defaultAudioLanguage is missing/null, scan the title for
+//      dominant non-Latin script characters. If more than 30% of the
+//      non-whitespace title is in CJK, Cyrillic, Arabic, Devanagari,
+//      Thai, Hangul, Hebrew, etc, reject. Otherwise allow.
+//
+// The 30% threshold lets occasional emoji or foreign words in an
+// otherwise-English title through (e.g. an English title with a Japanese
+// place name in it).
+function isLikelyEnglish(video) {
+  const langField = video.snippet?.defaultAudioLanguage || video.snippet?.defaultLanguage;
+  if (langField) {
+    return langField.toLowerCase().startsWith('en');
+  }
+  const title = video.snippet?.title || '';
+  if (!title) return true;   // no title to judge, allow
+
+  // Count non-Latin script characters in the title.
+  // We're looking for code-point ranges that are clearly non-Latin.
+  const nonLatinRanges = [
+    [0x0400, 0x04FF],   // Cyrillic
+    [0x0500, 0x052F],   // Cyrillic supplement
+    [0x0600, 0x06FF],   // Arabic
+    [0x0700, 0x074F],   // Syriac
+    [0x0900, 0x097F],   // Devanagari
+    [0x0E00, 0x0E7F],   // Thai
+    [0x3040, 0x309F],   // Hiragana
+    [0x30A0, 0x30FF],   // Katakana
+    [0x3400, 0x4DBF],   // CJK Extension A
+    [0x4E00, 0x9FFF],   // CJK Unified Ideographs
+    [0xAC00, 0xD7AF],   // Hangul syllables
+    [0x0590, 0x05FF],   // Hebrew
+  ];
+  let nonLatin = 0;
+  let total    = 0;
+  for (const ch of title) {
+    const cp = ch.codePointAt(0);
+    // skip whitespace and basic punctuation
+    if (cp <= 0x20 || (cp >= 0x21 && cp <= 0x2F) || (cp >= 0x3A && cp <= 0x40)) continue;
+    total++;
+    for (const [lo, hi] of nonLatinRanges) {
+      if (cp >= lo && cp <= hi) { nonLatin++; break; }
+    }
+  }
+  if (total === 0) return true;
+  const ratio = nonLatin / total;
+  return ratio < 0.30;
+}
+
+// ===== ROUTES ===============================================================
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'ebutuoy', has_key: !!YT_KEY });
@@ -198,37 +195,23 @@ app.post('/seen', (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /tag
-// Body: { video_id, tags: [...strings], title?, channel? }
-// Applies one or more tags to a video in one shot. If the tags array
-// includes "revisit", we also insert into revisit_queue (or refresh
-// the row if it's already there).
 app.post('/tag', (req, res) => {
   const { video_id, tags, title, channel } = req.body;
   if (!video_id) return res.status(400).json({ error: 'video_id required' });
   if (!Array.isArray(tags) || tags.length === 0) {
     return res.status(400).json({ error: 'tags array required' });
   }
-
-  const now           = Date.now();
-  const seenSnapshot  = getSeenCount();
+  const now          = Date.now();
+  const seenSnapshot = getSeenCount();
 
   for (const rawTag of tags) {
     const tag = String(rawTag).trim().toLowerCase();
     if (!tag) continue;
-
-    // record the tag application itself (for analytics later)
     db.run(
       'INSERT OR IGNORE INTO tag_actions (video_id, tag, applied_at, title, channel) VALUES (?, ?, ?, ?, ?)',
       [video_id, tag, now, title || null, channel || null]
     );
-
-    // the one tag with backend behaviour: revisit
     if (tag === 'revisit') {
-      // upsert into revisit_queue. If it's already there, refresh the
-      // tagged_at and videos_seen_at_tag so the eligibility clock restarts.
-      // We do this by delete-then-insert because sql.js's INSERT OR REPLACE
-      // would wipe last_replayed_at which we want to preserve for analytics.
       const existing = db.prepare('SELECT video_id FROM revisit_queue WHERE video_id = ?');
       existing.bind([video_id]);
       const exists = existing.step();
@@ -246,24 +229,14 @@ app.post('/tag', (req, res) => {
       }
     }
   }
-
   saveDb();
   res.json({ ok: true });
 });
 
-// GET /revisit-eligible
-// Returns up to N revisit-queued videos that have met both eligibility rules:
-//   - tagged at least REVISIT_MIN_HOURS hours ago
-//   - REVISIT_MIN_VIDEOS_SEEN videos have been served since the tag
-// The frontend calls this on each cross-fade. If anything is returned and
-// the 10-minute throttle has elapsed, the frontend will inject one of these
-// into the stumble queue instead of fetching from /search.
 app.get('/revisit-eligible', (req, res) => {
   const now          = Date.now();
   const minTagAge    = REVISIT_MIN_HOURS * 60 * 60 * 1000;
   const seenCount    = getSeenCount();
-  const minSeenDelta = REVISIT_MIN_VIDEOS_SEEN;
-
   const stmt = db.prepare(`
     SELECT video_id, title, channel, tagged_at, videos_seen_at_tag, last_replayed_at
     FROM revisit_queue
@@ -271,16 +244,14 @@ app.get('/revisit-eligible', (req, res) => {
       AND (? - videos_seen_at_tag) >= ?
     ORDER BY tagged_at ASC
   `);
-  stmt.bind([now, minTagAge, seenCount, minSeenDelta]);
-
+  stmt.bind([now, minTagAge, seenCount, REVISIT_MIN_VIDEOS_SEEN]);
   const eligible = [];
   while (stmt.step()) eligible.push(stmt.getAsObject());
   stmt.free();
-
   res.json({
     eligible,
-    count:           eligible.length,
-    now_seen_count:  seenCount,
+    count:          eligible.length,
+    now_seen_count: seenCount,
     eligibility_rule: {
       min_hours_since_tag:       REVISIT_MIN_HOURS,
       min_videos_seen_since_tag: REVISIT_MIN_VIDEOS_SEEN
@@ -288,15 +259,11 @@ app.get('/revisit-eligible', (req, res) => {
   });
 });
 
-// POST /revisit-played
-// Called by the frontend after it has actually served a revisit video.
-// Updates last_replayed_at AND resets tagged_at + videos_seen_at_tag so
-// the eligibility clock restarts for the next cycle.
 app.post('/revisit-played', (req, res) => {
   const { video_id } = req.body;
   if (!video_id) return res.status(400).json({ error: 'video_id required' });
-  const now         = Date.now();
-  const seenCount   = getSeenCount();
+  const now       = Date.now();
+  const seenCount = getSeenCount();
   db.run(
     'UPDATE revisit_queue SET last_replayed_at = ?, tagged_at = ?, videos_seen_at_tag = ? WHERE video_id = ?',
     [now, now, seenCount, video_id]
@@ -305,7 +272,6 @@ app.post('/revisit-played', (req, res) => {
   res.json({ ok: true });
 });
 
-// GET /search  (unchanged from prior version)
 app.get('/search', async (req, res) => {
   if (!YT_KEY) return res.status(500).json({ error: 'no api key configured on server' });
   let { q, lat, lng, radius } = req.query;
@@ -352,7 +318,22 @@ app.get('/search', async (req, res) => {
     const videoResp = await fetch(videoUrl);
     const videoData = await videoResp.json();
 
-    const channelIds = [...new Set(videoData.items.map(v => v.snippet.channelId))];
+    // Apply the language filter EARLY, before we waste channel-quota calls
+    // on videos that are going to be rejected anyway.
+    const englishVideos = (videoData.items || []).filter(isLikelyEnglish);
+
+    if (englishVideos.length === 0) {
+      return res.json({
+        videos:                  [],
+        location:                chosenLocation,
+        fetched:                 videoIds.length,
+        after_seen_filter:       freshIds.length,
+        after_language_filter:   0,
+        after_popularity_filter: 0
+      });
+    }
+
+    const channelIds = [...new Set(englishVideos.map(v => v.snippet.channelId))];
     const channelUrl = new URL('https://www.googleapis.com/youtube/v3/channels');
     channelUrl.searchParams.set('part', 'statistics');
     channelUrl.searchParams.set('id',   channelIds.join(','));
@@ -364,7 +345,7 @@ app.get('/search', async (req, res) => {
       subsByChannel[c.id] = parseInt(c.statistics.subscriberCount || '0', 10);
     });
 
-    const filtered = videoData.items
+    const filtered = englishVideos
       .filter(v => {
         const views = parseInt(v.statistics.viewCount || '0', 10);
         const subs  = subsByChannel[v.snippet.channelId] || 0;
@@ -379,7 +360,8 @@ app.get('/search', async (req, res) => {
         duration:   v.contentDetails.duration,
         views:      parseInt(v.statistics.viewCount || '0', 10),
         subs:       subsByChannel[v.snippet.channelId] || 0,
-        thumbnail:  v.snippet.thumbnails.medium?.url
+        thumbnail:  v.snippet.thumbnails.medium?.url,
+        lang:       v.snippet.defaultAudioLanguage || v.snippet.defaultLanguage || null
       }));
 
     res.json({
@@ -387,6 +369,7 @@ app.get('/search', async (req, res) => {
       location:                chosenLocation,
       fetched:                 videoIds.length,
       after_seen_filter:       freshIds.length,
+      after_language_filter:   englishVideos.length,
       after_popularity_filter: filtered.length
     });
 
@@ -395,7 +378,29 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ===== bootstrap ============================================================
+
+// GET /tag-counts
+// Returns every tag with the count of distinct videos tagged with it.
+app.get('/tag-counts', (req, res) => {
+  const stmt = db.prepare('SELECT tag, COUNT(DISTINCT video_id) AS count FROM tag_actions GROUP BY tag ORDER BY count DESC');
+  const tags = [];
+  while (stmt.step()) tags.push(stmt.getAsObject());
+  stmt.free();
+  res.json({ tags });
+});
+
+// GET /playlist?tag=X
+// Returns all videos tagged with the given tag, newest tag-time first.
+app.get('/playlist', (req, res) => {
+  const tag = (req.query.tag || '').trim().toLowerCase();
+  if (!tag) return res.status(400).json({ error: 'tag param required' });
+  const stmt = db.prepare('SELECT DISTINCT video_id, title, channel, MAX(applied_at) AS tagged_at FROM tag_actions WHERE tag = ? GROUP BY video_id ORDER BY tagged_at DESC');
+  stmt.bind([tag]);
+  const videos = [];
+  while (stmt.step()) videos.push(stmt.getAsObject());
+  stmt.free();
+  res.json({ tag, count: videos.length, videos });
+});
 
 const PORT = process.env.PORT || 3000;
 initDb().then(() => {
