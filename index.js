@@ -20,10 +20,17 @@
 //    GET  /health   service status check
 //    GET  /seen     list of every video_id this profile has been served
 //    POST /seen     record that a video was served (frontend calls on each play)
-//    GET  /search   discover obscure videos matching topic and/or location
+//    GET  /search   discover obscure videos (topic, local, or random roulette)
+//
+//  Search modes (passed to /search):
+//    Topic    ?q=topic_string
+//    Local    ?lat=X&lng=Y&radius=50km        (radius optional)
+//    Roulette ?random=true                    (server picks a global lat/lng)
+//    Mixed    any combination of the above
 //
 // ----------------------------------------------------------------------------
 //  Authorship log (most recent first):
+//    [ORANGE]  add roulette mode (random global geo), expand /search
 //    [ORANGE]  initial scaffold + search pipeline
 // ----------------------------------------------------------------------------
 
@@ -34,8 +41,7 @@ const cors      = require('cors');        // allow cross-origin requests from Ve
 const initSqlJs = require('sql.js');      // WebAssembly SQLite, no native build required
 const fs        = require('fs');          // filesystem access for db persistence
 const path      = require('path');        // safe path joining across OSes
-require('dotenv').config();               // load YOUTUBE_API_KEY from .env on local dev
-                                          // Railway injects env vars directly so .env is local only
+require('dotenv').config();               // load YOUTUBE_API_KEY from .env on local dev only
 
 // ===== app setup ============================================================
 
@@ -45,65 +51,97 @@ app.use(express.json());                  // auto-parse JSON request bodies into
 
 // ===== configuration ========================================================
 
-const DB_PATH   = path.join(__dirname, 'ebutuoy.db');   // sqlite file lives next to index.js
-const YT_KEY    = process.env.YOUTUBE_API_KEY;          // YouTube Data API v3 key, set on Railway
-const MAX_VIEWS = 1000;                                 // hard cap: skip any video with this many views or more
-const MAX_SUBS  = 1000;                                 // hard cap: skip any channel with this many subs or more
-const FETCH_N   = 50;                                   // how many candidates to pull per search (YouTube max)
+const DB_PATH   = path.join(__dirname, 'ebutuoy.db');
+const YT_KEY    = process.env.YOUTUBE_API_KEY;
+const MAX_VIEWS = 1000;
+const MAX_SUBS  = 1000;
+const FETCH_N   = 50;
 
 // ===== database =============================================================
 
-let db;   // module-level handle, populated by initDb() before the server starts
+let db;
 
 // initDb()
 // Loads the SQLite database from disk if it exists, otherwise creates a fresh
 // in-memory database. Ensures the seen_videos table exists either way.
-// sql.js keeps everything in memory; we export to disk after every write.
 async function initDb() {
   const SQL = await initSqlJs();
   if (fs.existsSync(DB_PATH)) {
-    // load existing db file into memory
     db = new SQL.Database(fs.readFileSync(DB_PATH));
   } else {
-    // brand new database
     db = new SQL.Database();
   }
-  // idempotent: only creates the table the first time
   db.run(`
     CREATE TABLE IF NOT EXISTS seen_videos (
-      video_id  TEXT PRIMARY KEY,    -- YouTube video id, unique
-      seen_at   INTEGER NOT NULL,    -- unix ms timestamp of when it was served
-      title     TEXT,                -- captured for later browsing of history
-      channel   TEXT                 -- captured for later browsing of history
+      video_id  TEXT PRIMARY KEY,
+      seen_at   INTEGER NOT NULL,
+      title     TEXT,
+      channel   TEXT
     )
   `);
   saveDb();
 }
 
 // saveDb()
-// Serialises the in-memory sql.js database to a binary blob and writes it to
-// disk. Called after every write so a crash or restart never loses log data.
+// Serialises in-memory sql.js database to disk after every write.
 function saveDb() {
   fs.writeFileSync(DB_PATH, Buffer.from(db.export()));
 }
 
 // getSeenSet()
-// Returns a JavaScript Set of every video_id ever served to this profile.
-// Used by /search to filter out anything already seen.
-// Returning a Set (not an array) makes the per-video lookup O(1) inside the filter loop.
+// Returns a JavaScript Set of every video_id already served.
+// O(1) lookup per video during filtering.
 function getSeenSet() {
   const stmt = db.prepare('SELECT video_id FROM seen_videos');
   const set  = new Set();
   while (stmt.step()) set.add(stmt.getAsObject().video_id);
-  stmt.free();   // sql.js requires explicit cleanup of prepared statements
+  stmt.free();
   return set;
+}
+
+// ===== helpers ==============================================================
+
+// randomLand()
+// Returns a random lat/lng coordinate biased toward populated landmasses.
+// Pure random across the globe lands in ocean about 71% of the time, which
+// would waste API quota on empty searches. Instead we sample from a curated
+// list of population-dense rectangles. Each rectangle is [minLat, maxLat,
+// minLng, maxLng]. Picked by area-weighted random for rough fairness.
+//
+// This is intentionally crude. The goal is geographic diversity, not
+// statistical accuracy. If a session lands in rural Mongolia and finds no
+// geotagged videos, that's fine, the frontend just calls /search again.
+function randomLand() {
+  const regions = [
+    // North America (continental US, Mexico, southern Canada)
+    [25,  50,  -125, -70],
+    // South America (most of it)
+    [-40, 10,  -80,  -40],
+    // Europe
+    [36,  60,  -10,  40],
+    // Africa (sub-Saharan band + north)
+    [-30, 35,  -15,  45],
+    // Middle East + South Asia
+    [10,  40,  35,   90],
+    // East Asia
+    [20,  45,  100,  145],
+    // Southeast Asia + Australia
+    [-40, 20,  95,   155],
+  ];
+  const r       = regions[Math.floor(Math.random() * regions.length)];
+  const lat     = r[0] + Math.random() * (r[1] - r[0]);
+  const lng     = r[2] + Math.random() * (r[3] - r[2]);
+  // round to 4 decimals (about 11 meters of precision, plenty)
+  return {
+    lat: Number(lat.toFixed(4)),
+    lng: Number(lng.toFixed(4))
+  };
 }
 
 // ===== routes ===============================================================
 
 // GET /health
 // Lightweight status check. Railway uses this for uptime monitoring.
-// has_key flag lets us debug "is the env var even visible to the process" without exposing the value.
 app.get('/health', (req, res) => {
   res.json({
     status:  'ok',
@@ -114,7 +152,6 @@ app.get('/health', (req, res) => {
 
 // GET /seen
 // Returns every video_id this profile has ever been served.
-// Frontend calls this once at app launch to build its local filter.
 app.get('/seen', (req, res) => {
   const ids = Array.from(getSeenSet());
   res.json({ count: ids.length, video_ids: ids });
@@ -122,8 +159,7 @@ app.get('/seen', (req, res) => {
 
 // POST /seen
 // Records a single video as having been served.
-// Frontend calls this every time a 30-second sample starts playing.
-// INSERT OR IGNORE silently skips duplicates, so accidental double-posts are harmless.
+// INSERT OR IGNORE silently skips duplicates.
 app.post('/seen', (req, res) => {
   const { video_id, title, channel } = req.body;
   if (!video_id) {
@@ -137,32 +173,48 @@ app.post('/seen', (req, res) => {
   res.json({ ok: true });
 });
 
-// GET /search?q=...&lat=...&lng=...&radius=...
-// The core discovery endpoint. Returns videos under MAX_VIEWS from channels
-// under MAX_SUBS, with anything in the seen log removed.
+// GET /search
+// The core discovery endpoint.
 //
-// Query params (all optional, at least one should be supplied):
-//   q        topic search string, e.g. "submarine sigint"
-//   lat,lng  geographic centre point (decimal degrees)
-//   radius   geographic search radius, e.g. "50km" (default 50km when lat/lng given)
+// Query params (all optional, combine freely):
+//   q         topic search string
+//   lat,lng   geographic centre point (decimal degrees)
+//   radius    geographic search radius, e.g. "50km" (default 50km)
+//   random    if "true", server picks a random global lat/lng (Roulette mode)
 //
-// The endpoint runs a three-call pipeline against YouTube:
-//   1. /search   -> get up to 50 candidate video ids
-//   2. /videos   -> for surviving ids, fetch view counts + channel ids
-//   3. /channels -> for those channels, fetch subscriber counts
-// then applies the seen-filter and popularity-filter on top.
+// Mode resolution:
+//   - random=true overrides any lat/lng the client sent
+//   - q and geo can coexist (e.g. "metal detecting" + somewhere in Europe)
+//   - if absolutely nothing is supplied we treat it as random for safety
 app.get('/search', async (req, res) => {
   if (!YT_KEY) {
     return res.status(500).json({ error: 'no api key configured on server' });
   }
 
-  const { q, lat, lng, radius } = req.query;
+  let { q, lat, lng, radius } = req.query;
+  const wantRandom = req.query.random === 'true';
+
+  // ---- Roulette mode: server picks the coordinates ------------------------
+  let chosenLocation = null;
+  if (wantRandom) {
+    const pick = randomLand();
+    lat = String(pick.lat);
+    lng = String(pick.lng);
+    chosenLocation = pick;
+  }
+
+  // ---- Safety fallback: if no query AND no geo, force a random pick -------
+  // Stops the endpoint from making a wide-open YouTube call that just
+  // returns the most popular videos in the entire system.
+  if (!q && (!lat || !lng)) {
+    const pick = randomLand();
+    lat = String(pick.lat);
+    lng = String(pick.lng);
+    chosenLocation = pick;
+  }
 
   try {
-    // ---- step 1: search for candidates ------------------------------------
-    // We sort by date (newest first) because recent uploads have had less time
-    // to accumulate views, so they are far more likely to pass the popularity
-    // filter than YouTube's default "relevance" sort.
+    // ---- step 1: search for candidates ----------------------------------
     const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
     searchUrl.searchParams.set('part',       'snippet');
     searchUrl.searchParams.set('type',       'video');
@@ -173,8 +225,6 @@ app.get('/search', async (req, res) => {
       searchUrl.searchParams.set('q', q);
     }
     if (lat && lng) {
-      // YouTube geo search returns only videos with location metadata, which
-      // is a minority of all uploads but exactly the obscure pool we want.
       searchUrl.searchParams.set('location',       `${lat},${lng}`);
       searchUrl.searchParams.set('locationRadius', radius || '50km');
     }
@@ -185,34 +235,37 @@ app.get('/search', async (req, res) => {
       return res.status(500).json({ error: searchData.error.message });
     }
 
-    // pull the video ids out of the search results
     const videoIds = (searchData.items || [])
       .map(i => i.id.videoId)
       .filter(Boolean);
     if (videoIds.length === 0) {
-      return res.json({ videos: [], note: 'no results from youtube search' });
+      return res.json({
+        videos:   [],
+        location: chosenLocation,
+        note:     'no results from youtube search'
+      });
     }
 
-    // ---- step 2: drop anything already seen --------------------------------
+    // ---- step 2: drop anything already seen -----------------------------
     const seen     = getSeenSet();
     const freshIds = videoIds.filter(id => !seen.has(id));
     if (freshIds.length === 0) {
-      return res.json({ videos: [], note: 'all results already in seen log' });
+      return res.json({
+        videos:   [],
+        location: chosenLocation,
+        note:     'all results already in seen log'
+      });
     }
 
-    // ---- step 3: fetch full details for the survivors ----------------------
-    // /videos lets us batch up to 50 ids in a single call, so cost stays low.
+    // ---- step 3: fetch full video details -------------------------------
     const videoUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
     videoUrl.searchParams.set('part', 'snippet,statistics,contentDetails');
     videoUrl.searchParams.set('id',   freshIds.join(','));
     videoUrl.searchParams.set('key',  YT_KEY);
-
     const videoResp = await fetch(videoUrl);
     const videoData = await videoResp.json();
 
-    // ---- step 4: fetch subscriber counts for the channels involved ---------
-    // We dedupe the channel ids so we never ask about the same channel twice
-    // in one batch. /channels also accepts comma-separated ids.
+    // ---- step 4: fetch subscriber counts for each unique channel --------
     const channelIds = [...new Set(videoData.items.map(v => v.snippet.channelId))];
     const channelUrl = new URL('https://www.googleapis.com/youtube/v3/channels');
     channelUrl.searchParams.set('part', 'statistics');
@@ -220,15 +273,12 @@ app.get('/search', async (req, res) => {
     channelUrl.searchParams.set('key',  YT_KEY);
     const channelResp = await fetch(channelUrl);
     const channelData = await channelResp.json();
-
-    // build a quick lookup map: channel_id -> subscriber_count
     const subsByChannel = {};
     (channelData.items || []).forEach(c => {
       subsByChannel[c.id] = parseInt(c.statistics.subscriberCount || '0', 10);
     });
 
-    // ---- step 5: apply the popularity filter ------------------------------
-    // Both rules must pass: view count under cap AND subscriber count under cap.
+    // ---- step 5: popularity filter --------------------------------------
     const filtered = videoData.items
       .filter(v => {
         const views = parseInt(v.statistics.viewCount || '0', 10);
@@ -241,17 +291,17 @@ app.get('/search', async (req, res) => {
         channel:    v.snippet.channelTitle,
         channel_id: v.snippet.channelId,
         published:  v.snippet.publishedAt,
-        duration:   v.contentDetails.duration,                              // ISO 8601, e.g. PT3M14S
+        duration:   v.contentDetails.duration,
         views:      parseInt(v.statistics.viewCount || '0', 10),
         subs:       subsByChannel[v.snippet.channelId] || 0,
         thumbnail:  v.snippet.thumbnails.medium?.url
       }));
 
-    // ---- response ---------------------------------------------------------
-    // The funnel counts make it obvious whether the search itself is dry or
-    // whether the popularity filter is doing the cutting.
+    // ---- response -------------------------------------------------------
+    // location field is null unless Roulette mode picked a coordinate.
     res.json({
       videos:                  filtered,
+      location:                chosenLocation,
       fetched:                 videoIds.length,
       after_seen_filter:       freshIds.length,
       after_popularity_filter: filtered.length
@@ -263,9 +313,6 @@ app.get('/search', async (req, res) => {
 });
 
 // ===== bootstrap ============================================================
-// Railway sets PORT automatically; locally we fall back to 3000 so curl works.
-// We wait for initDb() to finish before binding the listener so no request
-// can ever land before the database is ready.
 
 const PORT = process.env.PORT || 3000;
 initDb().then(() => {
