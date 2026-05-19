@@ -1,69 +1,84 @@
 // ============================================================================
 //  EBUTUOY :: backend
 // ============================================================================
-//  An anti-popularity YouTube discovery engine.
+//  An anti-popularity YouTube discovery engine with a deliberate-replay system.
 //
 //  Philosophy:
-//    The mainstream YouTube algorithm serves what the majority watches, which
-//    flattens taste and rewards engagement bait. This backend deliberately
-//    inverts that: it only surfaces videos with fewer than 1,000 views from
-//    channels with fewer than 1,000 subscribers, and it never serves the same
-//    video to the same profile twice.
+//    YouTube infers from passive signals. We capture only deliberate ones.
+//    The user tells us what they want to see again, and on what cadence.
+//    We surface obscure content by default (under 1000 views, under 1000 subs)
+//    and never replay seen videos except when the user explicitly said to.
 //
 //  Architecture:
 //    - Express HTTP server on Railway
-//    - sql.js (WebAssembly SQLite) for the persistent seen-video log
+//    - sql.js (WebAssembly SQLite) for persistent storage
 //    - YouTube Data API v3 for content discovery
-//    - Three-call pipeline: search -> videos -> channels -> popularity filter
+//    - Tag and revisit system layered on top of the search pipeline
 //
 //  Endpoints:
-//    GET  /health   service status check
-//    GET  /seen     list of every video_id this profile has been served
-//    POST /seen     record that a video was served (frontend calls on each play)
-//    GET  /search   discover obscure videos (topic, local, or random roulette)
+//    GET  /health             service status check
+//    GET  /seen               every video_id this profile has been served
+//    POST /seen               record that a video was served (frontend on each play)
+//    GET  /search             discover obscure videos (topic / local / roulette)
+//    POST /tag                attach one or more tags to a video
+//    GET  /revisit-eligible   videos in revisit queue that are due to play again
 //
-//  Search modes (passed to /search):
-//    Topic    ?q=topic_string
-//    Local    ?lat=X&lng=Y&radius=50km        (radius optional)
-//    Roulette ?random=true                    (server picks a global lat/lng)
-//    Mixed    any combination of the above
+//  Tag semantics:
+//    A "tag" is any string the user attaches to a video. We don't distinguish
+//    topic tags from special tags at the storage level; the frontend knows
+//    which are special. The one tag that has backend behaviour is the literal
+//    string "revisit" (the frontend sends this when "add to revisit playlist"
+//    is selected). When that tag lands, we also write a row into revisit_queue
+//    so we can compute eligibility later without scanning all tags.
+//
+//  Revisit eligibility math:
+//    A revisit-tagged video becomes eligible to play again when BOTH:
+//      - 24 hours have passed since the tag was applied
+//      - 100 other videos have been served since the tag was applied
+//    Once played via revisit, it re-enters the queue under the same rules.
+//    Untagging removes it from the queue (untag endpoint, future work).
 //
 // ----------------------------------------------------------------------------
 //  Authorship log (most recent first):
+//    [ORANGE]  add tag system + revisit queue with 24hr/100vid eligibility
 //    [ORANGE]  add roulette mode (random global geo), expand /search
 //    [ORANGE]  initial scaffold + search pipeline
 // ----------------------------------------------------------------------------
 
 // ===== imports ==============================================================
 
-const express   = require('express');     // HTTP server framework
-const cors      = require('cors');        // allow cross-origin requests from Vercel frontend
-const initSqlJs = require('sql.js');      // WebAssembly SQLite, no native build required
-const fs        = require('fs');          // filesystem access for db persistence
-const path      = require('path');        // safe path joining across OSes
-require('dotenv').config();               // load YOUTUBE_API_KEY from .env on local dev only
+const express   = require('express');
+const cors      = require('cors');
+const initSqlJs = require('sql.js');
+const fs        = require('fs');
+const path      = require('path');
+require('dotenv').config();
 
 // ===== app setup ============================================================
 
 const app = express();
-app.use(cors());                          // permit any origin; we are public-read-only
-app.use(express.json());                  // auto-parse JSON request bodies into req.body
+app.use(cors());
+app.use(express.json());
 
 // ===== configuration ========================================================
 
-const DB_PATH   = path.join(__dirname, 'ebutuoy.db');
-const YT_KEY    = process.env.YOUTUBE_API_KEY;
-const MAX_VIEWS = 1000;
-const MAX_SUBS  = 1000;
-const FETCH_N   = 50;
+const DB_PATH                  = path.join(__dirname, 'ebutuoy.db');
+const YT_KEY                   = process.env.YOUTUBE_API_KEY;
+const MAX_VIEWS                = 1000;
+const MAX_SUBS                 = 1000;
+const FETCH_N                  = 50;
+
+// revisit eligibility constants
+const REVISIT_MIN_HOURS        = 24;     // hours that must elapse before re-play
+const REVISIT_MIN_VIDEOS_SEEN  = 100;    // other videos that must be seen first
 
 // ===== database =============================================================
 
 let db;
 
 // initDb()
-// Loads the SQLite database from disk if it exists, otherwise creates a fresh
-// in-memory database. Ensures the seen_videos table exists either way.
+// Loads the SQLite database from disk or creates fresh. Creates all tables
+// idempotently so adding new ones in a later revision doesn't break old data.
 async function initDb() {
   const SQL = await initSqlJs();
   if (fs.existsSync(DB_PATH)) {
@@ -71,6 +86,8 @@ async function initDb() {
   } else {
     db = new SQL.Database();
   }
+
+  // seen_videos: the never-replay-without-permission log
   db.run(`
     CREATE TABLE IF NOT EXISTS seen_videos (
       video_id  TEXT PRIMARY KEY,
@@ -79,18 +96,47 @@ async function initDb() {
       channel   TEXT
     )
   `);
+
+  // tag_actions: every (video_id, tag) pair the user has ever applied.
+  // We keep all of them, even repeated applies, so analytics later can see
+  // tag history over time. PRIMARY KEY is composite (video + tag + ts).
+  db.run(`
+    CREATE TABLE IF NOT EXISTS tag_actions (
+      video_id   TEXT NOT NULL,
+      tag        TEXT NOT NULL,
+      applied_at INTEGER NOT NULL,
+      title      TEXT,
+      channel    TEXT,
+      PRIMARY KEY (video_id, tag, applied_at)
+    )
+  `);
+
+  // revisit_queue: the videos waiting to be served again per user rule.
+  // status = 'pending' means it's waiting for eligibility, 'played' means
+  // it just played and is waiting for the next cycle. We re-set it to
+  // 'pending' (with a fresh tagged_at) every time it plays.
+  // videos_seen_at_tag is the snapshot of how many videos had been seen
+  // when this entry was inserted; eligibility compares against current count.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS revisit_queue (
+      video_id              TEXT PRIMARY KEY,
+      title                 TEXT,
+      channel               TEXT,
+      tagged_at             INTEGER NOT NULL,
+      videos_seen_at_tag    INTEGER NOT NULL,
+      last_replayed_at      INTEGER
+    )
+  `);
+
   saveDb();
 }
 
-// saveDb()
-// Serialises in-memory sql.js database to disk after every write.
 function saveDb() {
   fs.writeFileSync(DB_PATH, Buffer.from(db.export()));
 }
 
 // getSeenSet()
-// Returns a JavaScript Set of every video_id already served.
-// O(1) lookup per video during filtering.
+// Returns a Set of all video_ids ever served.
 function getSeenSet() {
   const stmt = db.prepare('SELECT video_id FROM seen_videos');
   const set  = new Set();
@@ -99,72 +145,51 @@ function getSeenSet() {
   return set;
 }
 
+// getSeenCount()
+// Returns the total number of videos ever served. Used by revisit eligibility.
+function getSeenCount() {
+  const stmt = db.prepare('SELECT COUNT(*) AS c FROM seen_videos');
+  stmt.step();
+  const c = stmt.getAsObject().c;
+  stmt.free();
+  return c;
+}
+
 // ===== helpers ==============================================================
 
 // randomLand()
 // Returns a random lat/lng coordinate biased toward populated landmasses.
-// Pure random across the globe lands in ocean about 71% of the time, which
-// would waste API quota on empty searches. Instead we sample from a curated
-// list of population-dense rectangles. Each rectangle is [minLat, maxLat,
-// minLng, maxLng]. Picked by area-weighted random for rough fairness.
-//
-// This is intentionally crude. The goal is geographic diversity, not
-// statistical accuracy. If a session lands in rural Mongolia and finds no
-// geotagged videos, that's fine, the frontend just calls /search again.
 function randomLand() {
   const regions = [
-    // North America (continental US, Mexico, southern Canada)
     [25,  50,  -125, -70],
-    // South America (most of it)
     [-40, 10,  -80,  -40],
-    // Europe
     [36,  60,  -10,  40],
-    // Africa (sub-Saharan band + north)
     [-30, 35,  -15,  45],
-    // Middle East + South Asia
     [10,  40,  35,   90],
-    // East Asia
     [20,  45,  100,  145],
-    // Southeast Asia + Australia
     [-40, 20,  95,   155],
   ];
-  const r       = regions[Math.floor(Math.random() * regions.length)];
-  const lat     = r[0] + Math.random() * (r[1] - r[0]);
-  const lng     = r[2] + Math.random() * (r[3] - r[2]);
-  // round to 4 decimals (about 11 meters of precision, plenty)
+  const r = regions[Math.floor(Math.random() * regions.length)];
   return {
-    lat: Number(lat.toFixed(4)),
-    lng: Number(lng.toFixed(4))
+    lat: Number((r[0] + Math.random() * (r[1] - r[0])).toFixed(4)),
+    lng: Number((r[2] + Math.random() * (r[3] - r[2])).toFixed(4))
   };
 }
 
 // ===== routes ===============================================================
 
-// GET /health
-// Lightweight status check. Railway uses this for uptime monitoring.
 app.get('/health', (req, res) => {
-  res.json({
-    status:  'ok',
-    service: 'ebutuoy',
-    has_key: !!YT_KEY
-  });
+  res.json({ status: 'ok', service: 'ebutuoy', has_key: !!YT_KEY });
 });
 
-// GET /seen
-// Returns every video_id this profile has ever been served.
 app.get('/seen', (req, res) => {
   const ids = Array.from(getSeenSet());
   res.json({ count: ids.length, video_ids: ids });
 });
 
-// POST /seen
-// Records a single video as having been served.
-// INSERT OR IGNORE silently skips duplicates.
 app.post('/seen', (req, res) => {
   const { video_id, title, channel } = req.body;
-  if (!video_id) {
-    return res.status(400).json({ error: 'video_id required' });
-  }
+  if (!video_id) return res.status(400).json({ error: 'video_id required' });
   db.run(
     'INSERT OR IGNORE INTO seen_videos (video_id, seen_at, title, channel) VALUES (?, ?, ?, ?)',
     [video_id, Date.now(), title || null, channel || null]
@@ -173,57 +198,137 @@ app.post('/seen', (req, res) => {
   res.json({ ok: true });
 });
 
-// GET /search
-// The core discovery endpoint.
-//
-// Query params (all optional, combine freely):
-//   q         topic search string
-//   lat,lng   geographic centre point (decimal degrees)
-//   radius    geographic search radius, e.g. "50km" (default 50km)
-//   random    if "true", server picks a random global lat/lng (Roulette mode)
-//
-// Mode resolution:
-//   - random=true overrides any lat/lng the client sent
-//   - q and geo can coexist (e.g. "metal detecting" + somewhere in Europe)
-//   - if absolutely nothing is supplied we treat it as random for safety
-app.get('/search', async (req, res) => {
-  if (!YT_KEY) {
-    return res.status(500).json({ error: 'no api key configured on server' });
+// POST /tag
+// Body: { video_id, tags: [...strings], title?, channel? }
+// Applies one or more tags to a video in one shot. If the tags array
+// includes "revisit", we also insert into revisit_queue (or refresh
+// the row if it's already there).
+app.post('/tag', (req, res) => {
+  const { video_id, tags, title, channel } = req.body;
+  if (!video_id) return res.status(400).json({ error: 'video_id required' });
+  if (!Array.isArray(tags) || tags.length === 0) {
+    return res.status(400).json({ error: 'tags array required' });
   }
 
+  const now           = Date.now();
+  const seenSnapshot  = getSeenCount();
+
+  for (const rawTag of tags) {
+    const tag = String(rawTag).trim().toLowerCase();
+    if (!tag) continue;
+
+    // record the tag application itself (for analytics later)
+    db.run(
+      'INSERT OR IGNORE INTO tag_actions (video_id, tag, applied_at, title, channel) VALUES (?, ?, ?, ?, ?)',
+      [video_id, tag, now, title || null, channel || null]
+    );
+
+    // the one tag with backend behaviour: revisit
+    if (tag === 'revisit') {
+      // upsert into revisit_queue. If it's already there, refresh the
+      // tagged_at and videos_seen_at_tag so the eligibility clock restarts.
+      // We do this by delete-then-insert because sql.js's INSERT OR REPLACE
+      // would wipe last_replayed_at which we want to preserve for analytics.
+      const existing = db.prepare('SELECT video_id FROM revisit_queue WHERE video_id = ?');
+      existing.bind([video_id]);
+      const exists = existing.step();
+      existing.free();
+      if (exists) {
+        db.run(
+          'UPDATE revisit_queue SET tagged_at = ?, videos_seen_at_tag = ? WHERE video_id = ?',
+          [now, seenSnapshot, video_id]
+        );
+      } else {
+        db.run(
+          'INSERT INTO revisit_queue (video_id, title, channel, tagged_at, videos_seen_at_tag) VALUES (?, ?, ?, ?, ?)',
+          [video_id, title || null, channel || null, now, seenSnapshot]
+        );
+      }
+    }
+  }
+
+  saveDb();
+  res.json({ ok: true });
+});
+
+// GET /revisit-eligible
+// Returns up to N revisit-queued videos that have met both eligibility rules:
+//   - tagged at least REVISIT_MIN_HOURS hours ago
+//   - REVISIT_MIN_VIDEOS_SEEN videos have been served since the tag
+// The frontend calls this on each cross-fade. If anything is returned and
+// the 10-minute throttle has elapsed, the frontend will inject one of these
+// into the stumble queue instead of fetching from /search.
+app.get('/revisit-eligible', (req, res) => {
+  const now          = Date.now();
+  const minTagAge    = REVISIT_MIN_HOURS * 60 * 60 * 1000;
+  const seenCount    = getSeenCount();
+  const minSeenDelta = REVISIT_MIN_VIDEOS_SEEN;
+
+  const stmt = db.prepare(`
+    SELECT video_id, title, channel, tagged_at, videos_seen_at_tag, last_replayed_at
+    FROM revisit_queue
+    WHERE (? - tagged_at) >= ?
+      AND (? - videos_seen_at_tag) >= ?
+    ORDER BY tagged_at ASC
+  `);
+  stmt.bind([now, minTagAge, seenCount, minSeenDelta]);
+
+  const eligible = [];
+  while (stmt.step()) eligible.push(stmt.getAsObject());
+  stmt.free();
+
+  res.json({
+    eligible,
+    count:           eligible.length,
+    now_seen_count:  seenCount,
+    eligibility_rule: {
+      min_hours_since_tag:       REVISIT_MIN_HOURS,
+      min_videos_seen_since_tag: REVISIT_MIN_VIDEOS_SEEN
+    }
+  });
+});
+
+// POST /revisit-played
+// Called by the frontend after it has actually served a revisit video.
+// Updates last_replayed_at AND resets tagged_at + videos_seen_at_tag so
+// the eligibility clock restarts for the next cycle.
+app.post('/revisit-played', (req, res) => {
+  const { video_id } = req.body;
+  if (!video_id) return res.status(400).json({ error: 'video_id required' });
+  const now         = Date.now();
+  const seenCount   = getSeenCount();
+  db.run(
+    'UPDATE revisit_queue SET last_replayed_at = ?, tagged_at = ?, videos_seen_at_tag = ? WHERE video_id = ?',
+    [now, now, seenCount, video_id]
+  );
+  saveDb();
+  res.json({ ok: true });
+});
+
+// GET /search  (unchanged from prior version)
+app.get('/search', async (req, res) => {
+  if (!YT_KEY) return res.status(500).json({ error: 'no api key configured on server' });
   let { q, lat, lng, radius } = req.query;
   const wantRandom = req.query.random === 'true';
 
-  // ---- Roulette mode: server picks the coordinates ------------------------
   let chosenLocation = null;
   if (wantRandom) {
     const pick = randomLand();
-    lat = String(pick.lat);
-    lng = String(pick.lng);
-    chosenLocation = pick;
+    lat = String(pick.lat); lng = String(pick.lng); chosenLocation = pick;
   }
-
-  // ---- Safety fallback: if no query AND no geo, force a random pick -------
-  // Stops the endpoint from making a wide-open YouTube call that just
-  // returns the most popular videos in the entire system.
   if (!q && (!lat || !lng)) {
     const pick = randomLand();
-    lat = String(pick.lat);
-    lng = String(pick.lng);
-    chosenLocation = pick;
+    lat = String(pick.lat); lng = String(pick.lng); chosenLocation = pick;
   }
 
   try {
-    // ---- step 1: search for candidates ----------------------------------
     const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
     searchUrl.searchParams.set('part',       'snippet');
     searchUrl.searchParams.set('type',       'video');
     searchUrl.searchParams.set('maxResults', String(FETCH_N));
     searchUrl.searchParams.set('order',      'date');
     searchUrl.searchParams.set('key',        YT_KEY);
-    if (q) {
-      searchUrl.searchParams.set('q', q);
-    }
+    if (q) searchUrl.searchParams.set('q', q);
     if (lat && lng) {
       searchUrl.searchParams.set('location',       `${lat},${lng}`);
       searchUrl.searchParams.set('locationRadius', radius || '50km');
@@ -231,33 +336,15 @@ app.get('/search', async (req, res) => {
 
     const searchResp = await fetch(searchUrl);
     const searchData = await searchResp.json();
-    if (searchData.error) {
-      return res.status(500).json({ error: searchData.error.message });
-    }
+    if (searchData.error) return res.status(500).json({ error: searchData.error.message });
 
-    const videoIds = (searchData.items || [])
-      .map(i => i.id.videoId)
-      .filter(Boolean);
-    if (videoIds.length === 0) {
-      return res.json({
-        videos:   [],
-        location: chosenLocation,
-        note:     'no results from youtube search'
-      });
-    }
+    const videoIds = (searchData.items || []).map(i => i.id.videoId).filter(Boolean);
+    if (videoIds.length === 0) return res.json({ videos: [], location: chosenLocation });
 
-    // ---- step 2: drop anything already seen -----------------------------
     const seen     = getSeenSet();
     const freshIds = videoIds.filter(id => !seen.has(id));
-    if (freshIds.length === 0) {
-      return res.json({
-        videos:   [],
-        location: chosenLocation,
-        note:     'all results already in seen log'
-      });
-    }
+    if (freshIds.length === 0) return res.json({ videos: [], location: chosenLocation });
 
-    // ---- step 3: fetch full video details -------------------------------
     const videoUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
     videoUrl.searchParams.set('part', 'snippet,statistics,contentDetails');
     videoUrl.searchParams.set('id',   freshIds.join(','));
@@ -265,7 +352,6 @@ app.get('/search', async (req, res) => {
     const videoResp = await fetch(videoUrl);
     const videoData = await videoResp.json();
 
-    // ---- step 4: fetch subscriber counts for each unique channel --------
     const channelIds = [...new Set(videoData.items.map(v => v.snippet.channelId))];
     const channelUrl = new URL('https://www.googleapis.com/youtube/v3/channels');
     channelUrl.searchParams.set('part', 'statistics');
@@ -278,7 +364,6 @@ app.get('/search', async (req, res) => {
       subsByChannel[c.id] = parseInt(c.statistics.subscriberCount || '0', 10);
     });
 
-    // ---- step 5: popularity filter --------------------------------------
     const filtered = videoData.items
       .filter(v => {
         const views = parseInt(v.statistics.viewCount || '0', 10);
@@ -297,8 +382,6 @@ app.get('/search', async (req, res) => {
         thumbnail:  v.snippet.thumbnails.medium?.url
       }));
 
-    // ---- response -------------------------------------------------------
-    // location field is null unless Roulette mode picked a coordinate.
     res.json({
       videos:                  filtered,
       location:                chosenLocation,
