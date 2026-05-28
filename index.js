@@ -76,6 +76,16 @@ async function initDb() {
     videos_seen_at_tag INTEGER NOT NULL,
     last_replayed_at   INTEGER
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS clips (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id   TEXT NOT NULL,
+    title      TEXT,
+    channel    TEXT,
+    start_sec  INTEGER NOT NULL,
+    end_sec    INTEGER NOT NULL,
+    clip_list  TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`);
   saveDb();
 }
 
@@ -400,6 +410,52 @@ app.get('/playlist', (req, res) => {
   while (stmt.step()) videos.push(stmt.getAsObject());
   stmt.free();
   res.json({ tag, count: videos.length, videos });
+});
+
+
+// GET /clip-lists
+// Returns every clip-list label with a count of clips filed under it.
+// Used to show counts in the wheel or a future clip playback menu.
+app.get('/clip-lists', (req, res) => {
+  const stmt = db.prepare('SELECT clip_list, COUNT(*) AS count FROM clips GROUP BY clip_list ORDER BY count DESC');
+  const lists = [];
+  while (stmt.step()) lists.push(stmt.getAsObject());
+  stmt.free();
+  res.json({ lists });
+});
+
+// GET /clips?list=X
+// Returns all clips in a given clip-list, or all clips if no list given.
+// Each clip has the video_id plus start_sec and end_sec for trimmed playback.
+app.get('/clips', (req, res) => {
+  const list = (req.query.list || '').trim().toLowerCase();
+  let stmt;
+  if (list) {
+    stmt = db.prepare('SELECT id, video_id, title, channel, start_sec, end_sec, clip_list, created_at FROM clips WHERE clip_list = ? ORDER BY created_at DESC');
+    stmt.bind([list]);
+  } else {
+    stmt = db.prepare('SELECT id, video_id, title, channel, start_sec, end_sec, clip_list, created_at FROM clips ORDER BY created_at DESC');
+  }
+  const clips = [];
+  while (stmt.step()) clips.push(stmt.getAsObject());
+  stmt.free();
+  res.json({ list: list || 'all', count: clips.length, clips });
+});
+
+// POST /clip
+// Body: { video_id, title?, channel?, start_sec, end_sec, clip_list }
+// Saves a single clip recipe (a trimmed segment of a video) to a clip-list.
+app.post('/clip', (req, res) => {
+  const { video_id, title, channel, start_sec, end_sec, clip_list } = req.body;
+  if (!video_id)  return res.status(400).json({ error: 'video_id required' });
+  if (!clip_list) return res.status(400).json({ error: 'clip_list required' });
+  if (start_sec == null || end_sec == null) return res.status(400).json({ error: 'start_sec and end_sec required' });
+  db.run(
+    'INSERT INTO clips (video_id, title, channel, start_sec, end_sec, clip_list, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [video_id, title || null, channel || null, Math.round(start_sec), Math.round(end_sec), String(clip_list).trim().toLowerCase(), Date.now()]
+  );
+  saveDb();
+  res.json({ ok: true });
 });
 
 const PORT = process.env.PORT || 3000;
