@@ -604,7 +604,31 @@ app.post('/clip', (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== BOOT + SHUTDOWN =====================================================
+// With a volume attached, Railway stops the old container before starting
+// the new one on every deploy. A clean exit on SIGTERM keeps that from being
+// reported as a crash. Any error that would kill the process is logged
+// first so the Railway log shows the cause.
+
+process.on('unhandledRejection', err => { console.error('unhandled rejection:', err); });
+process.on('uncaughtException',  err => { console.error('uncaught exception:', err); });
+
+let server = null;
+function shutdown(signal) {
+  console.log('received ' + signal + ', saving and exiting');
+  try { if (db) saveDb(); } catch (e) { console.error('save on exit failed:', e.message); }
+  if (server) server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+
 const PORT = process.env.PORT || 3000;
-initDb().then(() => {
-  app.listen(PORT, () => console.log(`ebutuoy backend on :${PORT}`));
-});
+initDb()
+  .then(() => {
+    server = app.listen(PORT, () => console.log(`ebutuoy backend on :${PORT}`));
+  })
+  .catch(err => {
+    console.error('startup failed:', err);
+    process.exit(1);
+  });
