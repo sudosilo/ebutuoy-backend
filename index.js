@@ -56,7 +56,10 @@ app.use(express.json());
 
 // Where the database file lives. Railway volume first, then an explicit
 // override, then next to this script (local dev only, not persistent).
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.DATA_DIR || __dirname;
+// /data is checked too, in case a volume is mounted there without the env var.
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
+  || process.env.DATA_DIR
+  || (fs.existsSync('/data') ? '/data' : __dirname);
 const DB_PATH  = path.join(DATA_DIR, 'ebutuoy.db');
 
 const YT_KEY                   = process.env.YOUTUBE_API_KEY;
@@ -290,7 +293,7 @@ app.get('/health', (req, res) => {
     status:     'ok',
     service:    'ebutuoy',
     has_key:    !!YT_KEY,
-    persistent: !!process.env.RAILWAY_VOLUME_MOUNT_PATH,
+    persistent: DATA_DIR !== __dirname,
     db_path:    DB_PATH,
     quota_used_today_estimate: quota.used,
     quota_daily_limit:         DAILY_QUOTA
