@@ -11,15 +11,32 @@
 //    POST /tag                attach tags to a video
 //    GET  /revisit-eligible   videos due for replay
 //    POST /revisit-played     mark a revisit as just-played
+//    GET  /tag-counts, /playlist, /clip-lists, /clips, POST /clip
+//                             dormant: the current frontend no longer calls
+//                             them, kept so saved data stays reachable
 //
-//  Language filter (this revision):
-//    /search now drops videos whose defaultAudioLanguage is set to anything
+//  Language filter:
+//    /search drops videos whose defaultAudioLanguage is set to anything
 //    other than English (en, en-US, en-GB, etc). Videos with no language
 //    field set are allowed through (small creators often don't tag), and
 //    a script-based check rejects titles dominated by non-Latin scripts.
 //
+//  Playability filter (bug hunt revision):
+//    /search only returns videos that can play inside our embed: public,
+//    processed, embeddable, not live or upcoming, not age restricted, and
+//    not region blocked for the US. Before this, those slipped through and
+//    sat on a "video unavailable" screen for the full 30 seconds.
+//
+//  Storage:
+//    The SQLite file lives on the Railway volume when one is attached.
+//    Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically for a service with
+//    a volume. Without a volume the file sits next to this script and gets
+//    wiped on every redeploy, which is what was happening before.
+//
 // ----------------------------------------------------------------------------
 //  Authorship log (most recent first):
+//    [ORANGE]  bug hunt: playability filter, fail-closed sub lookup,
+//              pagination, quota tracking, volume-aware storage, atomic save
 //    [ORANGE]  add English-preferred language filter to /search
 //    [ORANGE]  add tag system + revisit queue with 24hr/100vid eligibility
 //    [ORANGE]  add roulette mode (random global geo), expand /search
@@ -37,23 +54,72 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const DB_PATH                  = path.join(__dirname, 'ebutuoy.db');
+// Where the database file lives. Railway volume first, then an explicit
+// override, then next to this script (local dev only, not persistent).
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.DATA_DIR || __dirname;
+const DB_PATH  = path.join(DATA_DIR, 'ebutuoy.db');
+
 const YT_KEY                   = process.env.YOUTUBE_API_KEY;
 const MAX_VIEWS                = 1000;
 const MAX_SUBS                 = 1000;
 const FETCH_N                  = 50;
 const REVISIT_MIN_HOURS        = 24;
 const REVISIT_MIN_VIDEOS_SEEN  = 100;
+const VIEWER_REGION            = 'US';    // used for the region block check
+
+// ===== YOUTUBE QUOTA TRACKING ==============================================
+// YouTube gives 10,000 units per day, reset at midnight Pacific time.
+// search costs 100, videos and channels cost 1 each. This counter is an
+// estimate kept in memory, so it resets if the server restarts. It is shown
+// on /health so you can see how much of the day is left.
+const DAILY_QUOTA = 10000;
+const quota = { day: null, used: 0 };
+
+function pacificDay() {
+  return new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+}
+
+function spendQuota(units) {
+  const today = pacificDay();
+  if (quota.day !== today) { quota.day = today; quota.used = 0; }
+  quota.used += units;
+}
+
+// ytGet(url, cost)
+// One place for every YouTube API call. Counts quota, parses JSON, and
+// turns a YouTube error into a thrown Error. Quota errors get a flag so the
+// route can answer 429 and the frontend can show a clear message.
+async function ytGet(url, cost) {
+  spendQuota(cost);
+  const resp = await fetch(url);
+  const data = await resp.json();
+  if (data.error) {
+    const reason = data.error.errors && data.error.errors[0] && data.error.errors[0].reason;
+    const err = new Error(data.error.message || 'youtube error');
+    err.quota = reason === 'quotaExceeded' || reason === 'dailyLimitExceeded';
+    throw err;
+  }
+  return data;
+}
 
 let db;
 
 async function initDb() {
   const SQL = await initSqlJs();
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  db = null;
   if (fs.existsSync(DB_PATH)) {
-    db = new SQL.Database(fs.readFileSync(DB_PATH));
-  } else {
-    db = new SQL.Database();
+    try {
+      db = new SQL.Database(fs.readFileSync(DB_PATH));
+    } catch (err) {
+      // A damaged file should not take the whole service down. Keep the bad
+      // file aside for inspection and start fresh.
+      console.error('db file unreadable, starting fresh:', err.message);
+      fs.renameSync(DB_PATH, DB_PATH + '.broken-' + Date.now());
+    }
   }
+  if (!db) db = new SQL.Database();
+  console.log('database at ' + DB_PATH);
   db.run(`CREATE TABLE IF NOT EXISTS seen_videos (
     video_id TEXT PRIMARY KEY,
     seen_at  INTEGER NOT NULL,
@@ -89,8 +155,13 @@ async function initDb() {
   saveDb();
 }
 
+// saveDb()
+// Writes to a temp file first, then renames over the real one. A rename is
+// all-or-nothing, so a crash mid-write can never leave a half-written db.
 function saveDb() {
-  fs.writeFileSync(DB_PATH, Buffer.from(db.export()));
+  const tmp = DB_PATH + '.tmp';
+  fs.writeFileSync(tmp, Buffer.from(db.export()));
+  fs.renameSync(tmp, DB_PATH);
 }
 
 function getSeenSet() {
@@ -183,10 +254,47 @@ function isLikelyEnglish(video) {
   return ratio < 0.30;
 }
 
+// ===== PLAYABILITY FILTER ==================================================
+
+// isPlayableInEmbed(video)
+// True only if the video will play inside our embedded player.
+// Needs the "status" part on the /videos call.
+function isPlayableInEmbed(video) {
+  const st = video.status || {};
+  if (st.embeddable !== true)          return false;   // uploader blocked embedding
+  if (st.privacyStatus !== 'public')   return false;
+  if (st.uploadStatus && st.uploadStatus !== 'processed') return false;
+
+  // live streams and upcoming premieres have no normal playback yet
+  const live = video.snippet && video.snippet.liveBroadcastContent;
+  if (live && live !== 'none') return false;
+
+  const cd = video.contentDetails || {};
+  // age restricted videos refuse to play in embeds
+  if (cd.contentRating && cd.contentRating.ytRating === 'ytAgeRestricted') return false;
+
+  // region block: either explicitly blocked here, or an allow list without us
+  const rr = cd.regionRestriction;
+  if (rr) {
+    if (Array.isArray(rr.blocked) && rr.blocked.includes(VIEWER_REGION)) return false;
+    if (Array.isArray(rr.allowed) && !rr.allowed.includes(VIEWER_REGION)) return false;
+  }
+  return true;
+}
+
 // ===== ROUTES ===============================================================
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'ebutuoy', has_key: !!YT_KEY });
+  spendQuota(0);   // rolls the counter over at midnight Pacific
+  res.json({
+    status:     'ok',
+    service:    'ebutuoy',
+    has_key:    !!YT_KEY,
+    persistent: !!process.env.RAILWAY_VOLUME_MOUNT_PATH,
+    db_path:    DB_PATH,
+    quota_used_today_estimate: quota.used,
+    quota_daily_limit:         DAILY_QUOTA
+  });
 });
 
 app.get('/seen', (req, res) => {
@@ -282,84 +390,118 @@ app.post('/revisit-played', (req, res) => {
   res.json({ ok: true });
 });
 
+// GET /search
+// Query params (combine freely):
+//   q          topic search string
+//   lat,lng    geographic centre point
+//   radius     search radius, default 50km
+//   random     "true" for Roulette (server picks a random spot)
+//   pageToken  token from a previous response, to get the NEXT page of the
+//              same search instead of the same 50 results again
+//
+// Pipeline: search (100 units) -> videos (1) -> channels (1) -> filters.
+// Filters, in order: seen log, playability, language, popularity.
+// Response always carries next_page_token (null when there are no more
+// pages) so the frontend can keep Topic and Local mode fresh.
 app.get('/search', async (req, res) => {
   if (!YT_KEY) return res.status(500).json({ error: 'no api key configured on server' });
-  let { q, lat, lng, radius } = req.query;
+  let { q, lat, lng, radius, pageToken } = req.query;
   const wantRandom = req.query.random === 'true';
 
   let chosenLocation = null;
   if (wantRandom) {
     const pick = randomLand();
     lat = String(pick.lat); lng = String(pick.lng); chosenLocation = pick;
+    pageToken = null;   // a page token from another spot means nothing here
   }
   if (!q && (!lat || !lng)) {
     const pick = randomLand();
     lat = String(pick.lat); lng = String(pick.lng); chosenLocation = pick;
+    pageToken = null;
   }
 
+  // helper so every early return has the same shape
+  const reply = (extra) => res.json(Object.assign({
+    videos: [], location: chosenLocation, next_page_token: null
+  }, extra));
+
   try {
+    // ---- step 1: candidates ---------------------------------------------
     const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
-    searchUrl.searchParams.set('part',       'snippet');
-    searchUrl.searchParams.set('type',       'video');
-    searchUrl.searchParams.set('maxResults', String(FETCH_N));
-    searchUrl.searchParams.set('order',      'date');
-    searchUrl.searchParams.set('key',        YT_KEY);
+    searchUrl.searchParams.set('part',           'snippet');
+    searchUrl.searchParams.set('type',           'video');
+    searchUrl.searchParams.set('maxResults',     String(FETCH_N));
+    searchUrl.searchParams.set('order',          'date');
+    searchUrl.searchParams.set('videoEmbeddable', 'true');   // free pre-filter
+    searchUrl.searchParams.set('key',            YT_KEY);
     if (q) searchUrl.searchParams.set('q', q);
     if (lat && lng) {
       searchUrl.searchParams.set('location',       `${lat},${lng}`);
       searchUrl.searchParams.set('locationRadius', radius || '50km');
     }
+    if (pageToken) searchUrl.searchParams.set('pageToken', String(pageToken));
 
-    const searchResp = await fetch(searchUrl);
-    const searchData = await searchResp.json();
-    if (searchData.error) return res.status(500).json({ error: searchData.error.message });
+    const searchData = await ytGet(searchUrl, 100);
+    const nextToken  = searchData.nextPageToken || null;
 
-    const videoIds = (searchData.items || []).map(i => i.id.videoId).filter(Boolean);
-    if (videoIds.length === 0) return res.json({ videos: [], location: chosenLocation });
+    const videoIds = (searchData.items || []).map(i => i.id && i.id.videoId).filter(Boolean);
+    if (videoIds.length === 0) return reply({ next_page_token: nextToken, fetched: 0 });
 
+    // ---- step 2: drop anything already seen ------------------------------
     const seen     = getSeenSet();
     const freshIds = videoIds.filter(id => !seen.has(id));
-    if (freshIds.length === 0) return res.json({ videos: [], location: chosenLocation });
+    if (freshIds.length === 0) return reply({ next_page_token: nextToken, fetched: videoIds.length, after_seen_filter: 0 });
 
+    // ---- step 3: full details, including status for the playability check
     const videoUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
-    videoUrl.searchParams.set('part', 'snippet,statistics,contentDetails');
+    videoUrl.searchParams.set('part', 'snippet,statistics,contentDetails,status');
     videoUrl.searchParams.set('id',   freshIds.join(','));
     videoUrl.searchParams.set('key',  YT_KEY);
-    const videoResp = await fetch(videoUrl);
-    const videoData = await videoResp.json();
+    const videoData = await ytGet(videoUrl, 1);
 
-    // Apply the language filter EARLY, before we waste channel-quota calls
-    // on videos that are going to be rejected anyway.
-    const englishVideos = (videoData.items || []).filter(isLikelyEnglish);
+    const playable      = (videoData.items || []).filter(isPlayableInEmbed);
+    const englishVideos = playable.filter(isLikelyEnglish);
 
     if (englishVideos.length === 0) {
-      return res.json({
-        videos:                  [],
-        location:                chosenLocation,
+      return reply({
+        next_page_token:         nextToken,
         fetched:                 videoIds.length,
         after_seen_filter:       freshIds.length,
+        after_playable_filter:   playable.length,
         after_language_filter:   0,
         after_popularity_filter: 0
       });
     }
 
+    // ---- step 4: subscriber counts -----------------------------------------
+    // Fail closed: before this revision a failed lookup made every channel
+    // read as zero subs, which let popular channels straight through.
     const channelIds = [...new Set(englishVideos.map(v => v.snippet.channelId))];
     const channelUrl = new URL('https://www.googleapis.com/youtube/v3/channels');
     channelUrl.searchParams.set('part', 'statistics');
     channelUrl.searchParams.set('id',   channelIds.join(','));
     channelUrl.searchParams.set('key',  YT_KEY);
-    const channelResp = await fetch(channelUrl);
-    const channelData = await channelResp.json();
+    const channelData = await ytGet(channelUrl, 1);
+
+    // subsByChannel[id] = number, or null when the channel hides its count
     const subsByChannel = {};
     (channelData.items || []).forEach(c => {
-      subsByChannel[c.id] = parseInt(c.statistics.subscriberCount || '0', 10);
+      const s = c.statistics || {};
+      subsByChannel[c.id] = s.hiddenSubscriberCount ? null : parseInt(s.subscriberCount || '0', 10);
     });
 
+    // ---- step 5: popularity filter ------------------------------------------
+    // A channel missing from the lookup is rejected (fail closed).
+    // A hidden sub count cannot be judged, so only the view cap applies.
     const filtered = englishVideos
       .filter(v => {
-        const views = parseInt(v.statistics.viewCount || '0', 10);
-        const subs  = subsByChannel[v.snippet.channelId] || 0;
-        return views < MAX_VIEWS && subs < MAX_SUBS;
+        const chId = v.snippet.channelId;
+        if (!(chId in subsByChannel)) return false;
+        const views = parseInt((v.statistics && v.statistics.viewCount) || '0', 10);
+        const subs  = subsByChannel[chId];
+        if (views >= MAX_VIEWS) return false;
+        if (subs !== null && subs >= MAX_SUBS) return false;
+        return true;
       })
       .map(v => ({
         id:         v.id,
@@ -368,26 +510,27 @@ app.get('/search', async (req, res) => {
         channel_id: v.snippet.channelId,
         published:  v.snippet.publishedAt,
         duration:   v.contentDetails.duration,
-        views:      parseInt(v.statistics.viewCount || '0', 10),
-        subs:       subsByChannel[v.snippet.channelId] || 0,
-        thumbnail:  v.snippet.thumbnails.medium?.url,
+        views:      parseInt((v.statistics && v.statistics.viewCount) || '0', 10),
+        subs:       subsByChannel[v.snippet.channelId] === null ? 'hidden' : subsByChannel[v.snippet.channelId],
+        thumbnail:  v.snippet.thumbnails && v.snippet.thumbnails.medium && v.snippet.thumbnails.medium.url,
         lang:       v.snippet.defaultAudioLanguage || v.snippet.defaultLanguage || null
       }));
 
-    res.json({
+    reply({
       videos:                  filtered,
-      location:                chosenLocation,
+      next_page_token:         nextToken,
       fetched:                 videoIds.length,
       after_seen_filter:       freshIds.length,
+      after_playable_filter:   playable.length,
       after_language_filter:   englishVideos.length,
       after_popularity_filter: filtered.length
     });
 
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (err.quota) return res.status(429).json({ error: 'quota_exceeded', message: 'YouTube daily quota used up. Resets at midnight Pacific.' });
+    res.status(502).json({ error: err.message });
   }
 });
-
 
 // GET /tag-counts
 // Returns every tag with the count of distinct videos tagged with it.
