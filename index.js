@@ -27,6 +27,11 @@
 //    not region blocked for the US. Before this, those slipped through and
 //    sat on a "video unavailable" screen for the full 30 seconds.
 //
+//  TV dial:
+//    GET /tv/channel?n=X, GET /tv/uploads?n=X&pageToken=, GET /tv/stats.
+//    Numbers 1 to 1,000,000, each locked to one channel the first time it
+//    is tuned. Any channel, any language, any size. See the TV DIAL block.
+//
 //  Storage:
 //    The SQLite file lives on the Railway volume when one is attached.
 //    Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically for a service with
@@ -35,6 +40,7 @@
 //
 // ----------------------------------------------------------------------------
 //  Authorship log (most recent first):
+//    [ORANGE]  tv dial: numbered channels 1 to 1,000,000
 //    [ORANGE]  bug hunt: playability filter, fail-closed sub lookup,
 //              pagination, quota tracking, volume-aware storage, atomic save
 //    [ORANGE]  add English-preferred language filter to /search
@@ -154,6 +160,34 @@ async function initDb() {
     end_sec    INTEGER NOT NULL,
     clip_list  TEXT NOT NULL,
     created_at INTEGER NOT NULL
+  )`);
+
+  // tv_channels: the dial. Each number from 1 to 1,000,000 gets one
+  // channel the first time anybody tunes to it, and keeps it forever.
+  db.run(`CREATE TABLE IF NOT EXISTS tv_channels (
+    number      INTEGER PRIMARY KEY,
+    channel_id  TEXT NOT NULL UNIQUE,
+    title       TEXT,
+    country     TEXT,
+    subs        INTEGER,
+    video_count INTEGER,
+    uploads_id  TEXT NOT NULL,
+    thumbnail   TEXT,
+    assigned_at INTEGER NOT NULL
+  )`);
+
+  // tv_pool: channels already found by a discovery search but not yet
+  // given a number. One search finds up to 50 channels, so most tunes to a
+  // new number come from here and cost almost nothing.
+  db.run(`CREATE TABLE IF NOT EXISTS tv_pool (
+    channel_id  TEXT PRIMARY KEY,
+    title       TEXT,
+    country     TEXT,
+    subs        INTEGER,
+    video_count INTEGER,
+    uploads_id  TEXT NOT NULL,
+    thumbnail   TEXT,
+    found_at    INTEGER NOT NULL
   )`);
   saveDb();
 }
@@ -602,6 +636,300 @@ app.post('/clip', (req, res) => {
   );
   saveDb();
   res.json({ ok: true });
+});
+
+// ===== TV DIAL ==============================================================
+//  The dial runs from 1 to TV_MAX. YouTube has no numbered list of channels,
+//  so the dial builds its own. The first time a number is tuned, a channel is
+//  taken from the pool and locked to that number for good. When the pool is
+//  empty, a discovery search refills it.
+//
+//  Discovery is built to be random, not popular: a random search string
+//  (a scrambled word, a camera filename like "IMG 4417", or a common word in
+//  one of many languages) inside a random month between 2008 and today.
+//  Any channel, any language, any size. A huge channel only shows up as
+//  often as chance allows.
+//
+//  Cost: a discovery search is 100 quota units and yields up to 50 channels.
+//  Tuning a number that already has a channel costs nothing. Playing a
+//  channel costs 2 units per page of 50 uploads, cached for 6 hours.
+// ============================================================================
+
+const TV_MAX        = 1000000;
+const TV_CACHE_MS   = 6 * 60 * 60 * 1000;
+const TV_EARLIEST   = Date.UTC(2008, 0, 1);
+
+// common words in many languages, used as search seeds
+const TV_WORDS = [
+  'today','home','music','walk','cat','dog','rain','cook','car','fix','test','new','my','vlog','day',
+  'hoy','casa','musica','perro','lluvia','cocina','viaje','familia',
+  'hoje','casa','musica','chuva','viagem','futebol',
+  'heute','haus','musik','regen','reise','auto',
+  'aujourd','maison','musique','pluie','voyage','cuisine',
+  'oggi','casa','musica','pioggia','viaggio','cucina',
+  'bugun','ev','muzik','yagmur','yemek',
+  'hari','rumah','musik','hujan','masak','jalan',
+  'ngay','nha','nhac','mua','nau',
+  'leo','nyumbani','muziki','mvua',
+  'dzisiaj','dom','muzyka','deszcz',
+  'vandaag','huis','muziek','regen',
+  'idag','hus','musik','regn',
+  'sevodnya','dom','muzyka','dozhd'
+];
+const TV_FILE_PREFIXES = ['IMG ', 'DSC ', 'MOV ', 'MVI ', 'VID ', 'GOPR', 'DSCF', 'P100'];
+
+function tvRandomQuery() {
+  const r = Math.random();
+  if (r < 0.40) {
+    // a short scrambled string, the classic way to land on random uploads
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let s = '';
+    const len = 3 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    return s;
+  }
+  if (r < 0.70) {
+    // default camera filenames: people who never renamed their upload
+    const p = TV_FILE_PREFIXES[Math.floor(Math.random() * TV_FILE_PREFIXES.length)];
+    return p + String(Math.floor(Math.random() * 10000)).padStart(4, '0');
+  }
+  return TV_WORDS[Math.floor(Math.random() * TV_WORDS.length)];
+}
+
+// a random 30 day window somewhere between 2008 and now
+function tvRandomWindow() {
+  const span  = Date.now() - TV_EARLIEST - 30 * 86400000;
+  const start = TV_EARLIEST + Math.floor(Math.random() * span);
+  return {
+    after:  new Date(start).toISOString(),
+    before: new Date(start + 30 * 86400000).toISOString()
+  };
+}
+
+function tvRowToChannel(row, number) {
+  return {
+    number:      number,
+    channel_id:  row.channel_id,
+    title:       row.title,
+    country:     row.country || null,
+    subs:        row.subs === null || row.subs === undefined ? 'hidden' : row.subs,
+    video_count: row.video_count,
+    thumbnail:   row.thumbnail || null
+  };
+}
+
+function tvGetAssigned(number) {
+  const stmt = db.prepare('SELECT * FROM tv_channels WHERE number = ?');
+  stmt.bind([number]);
+  const row = stmt.step() ? stmt.getAsObject() : null;
+  stmt.free();
+  return row;
+}
+
+function tvPoolCount() {
+  const stmt = db.prepare('SELECT COUNT(*) AS c FROM tv_pool');
+  stmt.step();
+  const c = stmt.getAsObject().c;
+  stmt.free();
+  return c;
+}
+
+// tvDiscover()
+// One random search, then one channels lookup for everything it found.
+// New channels with at least one video go into the pool.
+async function tvDiscover() {
+  const win = tvRandomWindow();
+  const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
+  searchUrl.searchParams.set('part',           'snippet');
+  searchUrl.searchParams.set('type',           'video');
+  searchUrl.searchParams.set('maxResults',     '50');
+  searchUrl.searchParams.set('q',              tvRandomQuery());
+  searchUrl.searchParams.set('order',          Math.random() < 0.5 ? 'date' : 'relevance');
+  searchUrl.searchParams.set('publishedAfter',  win.after);
+  searchUrl.searchParams.set('publishedBefore', win.before);
+  searchUrl.searchParams.set('key',            YT_KEY);
+  const data = await ytGet(searchUrl, 100);
+
+  // distinct channel ids not already on the dial or in the pool
+  const ids = [...new Set((data.items || []).map(i => i.snippet && i.snippet.channelId).filter(Boolean))];
+  const fresh = ids.filter(id => {
+    const a = db.prepare('SELECT 1 FROM tv_channels WHERE channel_id = ? UNION SELECT 1 FROM tv_pool WHERE channel_id = ?');
+    a.bind([id, id]);
+    const known = a.step();
+    a.free();
+    return !known;
+  });
+  if (fresh.length === 0) return 0;
+
+  const chUrl = new URL('https://www.googleapis.com/youtube/v3/channels');
+  chUrl.searchParams.set('part', 'snippet,statistics,contentDetails');
+  chUrl.searchParams.set('id',   fresh.join(','));
+  chUrl.searchParams.set('key',  YT_KEY);
+  const chData = await ytGet(chUrl, 1);
+
+  let added = 0;
+  (chData.items || []).forEach(c => {
+    const st = c.statistics || {};
+    const videoCount = parseInt(st.videoCount || '0', 10);
+    const uploads = c.contentDetails && c.contentDetails.relatedPlaylists && c.contentDetails.relatedPlaylists.uploads;
+    if (!uploads || videoCount < 1) return;
+    const thumbs = (c.snippet && c.snippet.thumbnails) || {};
+    db.run(
+      'INSERT OR IGNORE INTO tv_pool (channel_id, title, country, subs, video_count, uploads_id, thumbnail, found_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        c.id,
+        (c.snippet && c.snippet.title) || 'untitled channel',
+        (c.snippet && c.snippet.country) || null,
+        st.hiddenSubscriberCount ? null : parseInt(st.subscriberCount || '0', 10),
+        videoCount,
+        uploads,
+        (thumbs.default && thumbs.default.url) || null,
+        Date.now()
+      ]
+    );
+    added++;
+  });
+  saveDb();
+  return added;
+}
+
+// Only one discovery runs at a time. Two people tuning new numbers at the
+// same moment share one search instead of paying for two.
+let tvDiscoverPromise = null;
+function tvDiscoverOnce() {
+  if (!tvDiscoverPromise) {
+    tvDiscoverPromise = tvDiscover().finally(() => { tvDiscoverPromise = null; });
+  }
+  return tvDiscoverPromise;
+}
+
+// tvAssign(number)
+// Returns the channel locked to this number, assigning one if needed.
+async function tvAssign(number) {
+  const existing = tvGetAssigned(number);
+  if (existing) return existing;
+
+  // a few tries in case a random search comes back empty
+  for (let tries = 0; tries < 4 && tvPoolCount() === 0; tries++) {
+    await tvDiscoverOnce();
+  }
+
+  // another request may have assigned this number while we waited
+  const again = tvGetAssigned(number);
+  if (again) return again;
+
+  const pick = db.prepare('SELECT * FROM tv_pool ORDER BY RANDOM() LIMIT 1');
+  const row = pick.step() ? pick.getAsObject() : null;
+  pick.free();
+  if (!row) return null;
+
+  db.run(
+    'INSERT INTO tv_channels (number, channel_id, title, country, subs, video_count, uploads_id, thumbnail, assigned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [number, row.channel_id, row.title, row.country, row.subs, row.video_count, row.uploads_id, row.thumbnail, Date.now()]
+  );
+  db.run('DELETE FROM tv_pool WHERE channel_id = ?', [row.channel_id]);
+  saveDb();
+  return tvGetAssigned(number);
+}
+
+// tvUploads(uploadsId, pageToken)
+// One page of a channel's uploads, newest first, only videos that can play
+// in our embed. Cached so flipping back to a channel is free.
+const tvCache = new Map();
+async function tvUploads(uploadsId, pageToken) {
+  const key = uploadsId + '|' + (pageToken || '');
+  const hit = tvCache.get(key);
+  if (hit && Date.now() - hit.at < TV_CACHE_MS) return hit.value;
+
+  const plUrl = new URL('https://www.googleapis.com/youtube/v3/playlistItems');
+  plUrl.searchParams.set('part',       'contentDetails');
+  plUrl.searchParams.set('playlistId', uploadsId);
+  plUrl.searchParams.set('maxResults', '50');
+  plUrl.searchParams.set('key',        YT_KEY);
+  if (pageToken) plUrl.searchParams.set('pageToken', pageToken);
+  const pl = await ytGet(plUrl, 1);
+
+  const ids = (pl.items || []).map(i => i.contentDetails && i.contentDetails.videoId).filter(Boolean);
+  let videos = [];
+  if (ids.length) {
+    const vUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
+    vUrl.searchParams.set('part', 'snippet,statistics,contentDetails,status');
+    vUrl.searchParams.set('id',   ids.join(','));
+    vUrl.searchParams.set('key',  YT_KEY);
+    const vData = await ytGet(vUrl, 1);
+    const byId = {};
+    (vData.items || []).forEach(v => { byId[v.id] = v; });
+    videos = ids
+      .map(id => byId[id])
+      .filter(v => v && isPlayableInEmbed(v))
+      .map(v => ({
+        id:        v.id,
+        title:     v.snippet.title,
+        channel:   v.snippet.channelTitle,
+        published: v.snippet.publishedAt,
+        duration:  v.contentDetails.duration,
+        views:     parseInt((v.statistics && v.statistics.viewCount) || '0', 10)
+      }));
+  }
+
+  const value = { videos, next_page_token: pl.nextPageToken || null };
+  tvCache.set(key, { at: Date.now(), value });
+  if (tvCache.size > 2000) tvCache.delete(tvCache.keys().next().value);
+  return value;
+}
+
+function tvParseNumber(raw) {
+  const n = parseInt(String(raw || '').replace(/[^0-9]/g, ''), 10);
+  if (!Number.isFinite(n) || n < 1 || n > TV_MAX) return null;
+  return n;
+}
+
+function tvError(res, err) {
+  if (err.quota) return res.status(429).json({ error: 'quota_exceeded', message: 'YouTube daily limit used up. It resets at midnight Pacific.' });
+  if (/playlist.*not.*found|cannot be found/i.test(err.message)) return res.status(410).json({ error: 'off_air', message: 'This channel went off the air.' });
+  res.status(502).json({ error: err.message });
+}
+
+// GET /tv/channel?n=48213
+// The channel on that number plus its first page of uploads.
+app.get('/tv/channel', async (req, res) => {
+  if (!YT_KEY) return res.status(500).json({ error: 'no api key configured on server' });
+  const number = tvParseNumber(req.query.n);
+  if (!number) return res.status(400).json({ error: 'n must be a whole number from 1 to ' + TV_MAX });
+  try {
+    const row = await tvAssign(number);
+    if (!row) return res.status(503).json({ error: 'no_signal', message: 'No signal. Try again in a moment.' });
+    const page = await tvUploads(row.uploads_id, null);
+    res.json({ channel: tvRowToChannel(row, number), videos: page.videos, next_page_token: page.next_page_token });
+  } catch (err) {
+    tvError(res, err);
+  }
+});
+
+// GET /tv/uploads?n=48213&pageToken=xxxx
+// The next page of uploads for a number that already has a channel.
+app.get('/tv/uploads', async (req, res) => {
+  if (!YT_KEY) return res.status(500).json({ error: 'no api key configured on server' });
+  const number = tvParseNumber(req.query.n);
+  if (!number) return res.status(400).json({ error: 'n must be a whole number from 1 to ' + TV_MAX });
+  const row = tvGetAssigned(number);
+  if (!row) return res.status(404).json({ error: 'not tuned yet' });
+  try {
+    const page = await tvUploads(row.uploads_id, req.query.pageToken || null);
+    res.json(page);
+  } catch (err) {
+    tvError(res, err);
+  }
+});
+
+// GET /tv/stats
+// How much of the dial has been filled in.
+app.get('/tv/stats', (req, res) => {
+  const stmt = db.prepare('SELECT COUNT(*) AS c FROM tv_channels');
+  stmt.step();
+  const tuned = stmt.getAsObject().c;
+  stmt.free();
+  res.json({ tuned, pool: tvPoolCount(), dial_max: TV_MAX });
 });
 
 // ===== BOOT + SHUTDOWN =====================================================
